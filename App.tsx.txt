@@ -1,0 +1,269 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Asset, Candle, MarketMetrics, AIAnalysisResult, Timeframe, NewsItem, OrderBook as OrderBookType } from './types';
+import { SUPPORTED_ASSETS, AI_ANALYSIS_INTERVAL_MS, DISCLAIMER_TEXT, BINANCE_SYMBOL_MAP } from './constants';
+import { fetchHistoricalData, subscribeToMarket } from './services/marketDataService';
+import { getLatestMetrics } from './services/technicalAnalysis';
+import { analyzeMarket } from './services/geminiService';
+import { generateOrderBook } from './services/simulationService';
+import { fetchNews } from './services/newsService';
+import Header from './components/Header';
+import MarketChart from './components/MarketChart';
+import MetricCard from './components/MetricCard';
+import AIInsightPanel from './components/AIInsightPanel';
+import SystemMonitor from './components/SystemMonitor';
+import OrderBook from './components/OrderBook';
+import NewsWire from './components/NewsWire';
+
+const App: React.FC = () => {
+  const [currentAsset, setCurrentAsset] = useState<Asset>(SUPPORTED_ASSETS[0]);
+  const [marketData, setMarketData] = useState<Candle[]>([]);
+  const [metrics, setMetrics] = useState<MarketMetrics | null>(null);
+  const [aiAnalysis, setAiAnalysis] = useState<AIAnalysisResult | null>(null);
+  const [isLoadingAI, setIsLoadingAI] = useState(false);
+  const [currentTimeframe, setCurrentTimeframe] = useState<Timeframe>(Timeframe.H1);
+  const [latency, setLatency] = useState(45);
+  const [feedActive, setFeedActive] = useState(false);
+  const [aiStatus, setAiStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
+  const [isLive, setIsLive] = useState(false);
+  
+  // New States
+  const [orderBook, setOrderBook] = useState<OrderBookType | null>(null);
+  const [news, setNews] = useState<NewsItem[]>([]);
+
+  // Load Initial Data
+  useEffect(() => {
+    let isMounted = true;
+    const loadData = async () => {
+      setMarketData([]); 
+      // Do not reset news immediately to empty, let the fetch replace it smoothly
+      const data = await fetchHistoricalData(currentAsset, currentTimeframe);
+      if (isMounted) {
+        setMarketData(data);
+        setMetrics(getLatestMetrics(data));
+        setAiAnalysis(null);
+        setAiStatus('idle');
+        setIsLive(!!BINANCE_SYMBOL_MAP[currentAsset.symbol]);
+      }
+    };
+    loadData();
+    return () => { isMounted = false; };
+  }, [currentAsset, currentTimeframe]);
+
+  // News Feed Service (Polling)
+  useEffect(() => {
+    let isMounted = true;
+    const loadNews = async () => {
+      try {
+        const newsItems = await fetchNews(currentAsset);
+        if (isMounted) {
+          setNews(newsItems);
+        }
+      } catch (error) {
+        console.error("News fetch error:", error);
+      }
+    };
+
+    // Initial Load
+    loadNews();
+
+    // Poll every 60 seconds
+    const interval = setInterval(loadNews, 60000);
+    return () => {
+      isMounted = false; 
+      clearInterval(interval);
+    };
+  }, [currentAsset]);
+
+  // Subscribe to Real-time / Simulated Stream
+  useEffect(() => {
+    if (marketData.length === 0) return;
+
+    const lastCandle = marketData[marketData.length - 1];
+    
+    const unsubscribe = subscribeToMarket(
+      currentAsset, 
+      currentTimeframe,
+      lastCandle,
+      (updatedCandle, isFinal) => {
+        setMarketData(prevData => {
+          if (prevData.length === 0) return [updatedCandle];
+
+          const newData = [...prevData];
+          const lastIdx = newData.length - 1;
+          
+          if (newData[lastIdx].time === updatedCandle.time) {
+             newData[lastIdx] = updatedCandle;
+          } else {
+             newData.push(updatedCandle);
+             if (newData.length > 150) newData.shift();
+          }
+          
+          // Sync Calculations
+          const newMetrics = getLatestMetrics(newData);
+          setMetrics(newMetrics);
+          
+          // Generate Order Book based on new price
+          setOrderBook(generateOrderBook(updatedCandle.close, newMetrics.volatility));
+          
+          setLatency(Math.floor(Math.random() * 20) + 20);
+          setFeedActive(true);
+          setTimeout(() => setFeedActive(false), 200);
+
+          return newData;
+        });
+      }
+    );
+
+    return () => unsubscribe();
+  }, [currentAsset, currentTimeframe, marketData.length === 0]); 
+
+  // AI Analysis Loop
+  useEffect(() => {
+    if (!metrics || marketData.length === 0) return;
+
+    const performAnalysis = async () => {
+        setIsLoadingAI(true);
+        setAiStatus('processing');
+        
+        const currentPrice = marketData[marketData.length - 1].close;
+        // Pass recent news to AI
+        const result = await analyzeMarket(currentAsset, currentPrice, metrics, news);
+        
+        setAiAnalysis(result);
+        setIsLoadingAI(false);
+        setAiStatus(result.marketState !== 'Uncertain' ? 'success' : 'error');
+        
+        setTimeout(() => {
+            setAiStatus('idle');
+        }, 3000);
+    };
+
+    if (!aiAnalysis && aiStatus === 'idle') {
+        performAnalysis();
+    }
+
+    const interval = setInterval(() => {
+        performAnalysis();
+    }, AI_ANALYSIS_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [metrics, currentAsset, marketData.length, news.length]); // Re-run if news updates significantly
+
+  const latestCandle = marketData[marketData.length - 1];
+  const previousCandle = marketData.length > 1 ? marketData[marketData.length - 2] : null;
+  const priceChange = latestCandle && previousCandle ? latestCandle.close - previousCandle.close : 0;
+  const percentChange = latestCandle && previousCandle ? (priceChange / previousCandle.close) * 100 : 0;
+
+  return (
+    <div className="min-h-screen bg-institutional-900 text-institutional-100 font-sans selection:bg-purple-500 selection:text-white flex flex-col">
+      <Header 
+        currentAsset={currentAsset} 
+        onAssetChange={setCurrentAsset} 
+        latency={latency}
+      />
+
+      {/* Connection Status Banner */}
+      <div className="h-0.5 w-full bg-institutional-800">
+         {isLive && <div className="h-full bg-accent-up/50 animate-pulse w-full"></div>}
+      </div>
+
+      <main className="flex-1 p-6 max-w-[1800px] mx-auto w-full grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        {/* TOP: Metric Strip */}
+        <div className="lg:col-span-12 grid grid-cols-2 md:grid-cols-4 gap-4 h-fit">
+            <MetricCard 
+                label="Last Price" 
+                value={latestCandle?.close.toFixed(2) || '---'} 
+                trend={priceChange >= 0 ? 'up' : 'down'}
+                subValue={`${priceChange >= 0 ? '+' : ''}${percentChange.toFixed(2)}%`}
+            />
+            <MetricCard 
+                label="RSI (14)" 
+                value={metrics?.rsi.toFixed(1) || '---'} 
+                color={metrics?.rsi && (metrics.rsi > 70 || metrics.rsi < 30) ? 'danger' : 'default'}
+                subValue={metrics?.rsi > 70 ? 'Overbought' : metrics?.rsi < 30 ? 'Oversold' : 'Neutral'}
+            />
+            <MetricCard 
+                label="Volatility (ATR)" 
+                value={metrics?.volatility.toFixed(2) || '---'} 
+                color="accent"
+            />
+            <MetricCard 
+                label="MACD" 
+                value={metrics?.macd.value.toFixed(4) || '---'} 
+                trend={metrics?.macd.value > metrics?.macd.signal ? 'up' : 'down'}
+                subValue="Momentum"
+            />
+        </div>
+
+        {/* LEFT: Chart & Pipeline */}
+        <div className="lg:col-span-8 flex flex-col gap-6 h-[750px]">
+            {/* Chart Area */}
+            <div className="bg-institutional-800 rounded border border-institutional-700 p-1 flex-1 flex flex-col">
+                <div className="flex justify-between items-center px-4 py-2 border-b border-institutional-700 mb-2">
+                    <div className="flex items-center gap-3">
+                        <h2 className="text-sm font-semibold text-institutional-300 uppercase tracking-wider">Technical Structure</h2>
+                        {isLive ? (
+                             <span className="px-1.5 py-0.5 rounded bg-accent-up/10 border border-accent-up/20 text-[9px] font-bold text-accent-up uppercase">Real-time Socket</span>
+                        ) : (
+                             <span className="px-1.5 py-0.5 rounded bg-accent-warn/10 border border-accent-warn/20 text-[9px] font-bold text-accent-warn uppercase">Simulated Feed</span>
+                        )}
+                    </div>
+                    <div className="flex gap-2">
+                        {Object.values(Timeframe).map(tf => (
+                            <button 
+                                key={tf}
+                                onClick={() => setCurrentTimeframe(tf)}
+                                className={`px-2 py-1 text-xs font-mono rounded transition-colors ${currentTimeframe === tf ? 'bg-institutional-600 text-white' : 'text-institutional-500 hover:text-institutional-300'}`}
+                            >
+                                {tf}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+                <div className="flex-1 min-h-0">
+                    <MarketChart 
+                        data={marketData} 
+                        sma50={metrics?.sma50 || 0} 
+                    />
+                </div>
+            </div>
+
+            {/* Bottom Row: System Monitor & Order Book */}
+            <div className="h-48 grid grid-cols-2 gap-6">
+                <SystemMonitor 
+                    feedActive={feedActive} 
+                    aiStatus={aiStatus} 
+                    latency={latency} 
+                />
+                <OrderBook data={orderBook} />
+            </div>
+        </div>
+
+        {/* RIGHT: Intelligence & News */}
+        <div className="lg:col-span-4 flex flex-col gap-6 h-[750px]">
+            <div className="flex-1 min-h-0">
+                <AIInsightPanel analysis={aiAnalysis} isLoading={isLoadingAI} />
+            </div>
+            <div className="h-64">
+                <NewsWire news={news} />
+            </div>
+        </div>
+
+      </main>
+
+      <footer className="border-t border-institutional-800 py-6 text-center px-6 bg-institutional-900 z-10">
+        <p className="text-[10px] text-institutional-600 max-w-4xl mx-auto uppercase tracking-wide leading-relaxed">
+            {DISCLAIMER_TEXT}
+        </p>
+        <div className="mt-2 flex justify-center gap-4 text-[9px] text-institutional-600 font-mono">
+            <span>Server: AWS-US-EAST-1</span>
+            <span>Version: 2.5.0-ENT</span>
+            <span>Latency: {latency}ms</span>
+        </div>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
