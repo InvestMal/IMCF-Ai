@@ -17,7 +17,7 @@ const AIInsightPanel: React.FC<AIInsightPanelProps> = ({ analysis, isLoading }) 
       </div>
     );
   }
-
+  
   if (!analysis) return null;
 
   const getStateColor = (state: string) => {
